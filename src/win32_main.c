@@ -13,6 +13,7 @@
 #include <commdlg.h>
 #include <commctrl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "hw.h"
 
@@ -89,6 +90,11 @@ static int g_gain = 4096;         /* g_vol as a 12-bit gain (squared curve) */
 static int g_do_fs;               /* full screen requested from the Options window: done once it has closed */
 static void set_volume(int v) { if (v < 0) v = 0; if (v > 100) v = 100; g_vol = v; g_gain = v * v * 4096 / 10000; }
 static int g_intscale = 1;        /* prefer whole-number scaling when it fills most of the window */
+static int g_crt;                 /* software CRT look (crt.c); costs CPU only while on */
+static int g_pal_pref;            /* 50 Hz option from s3d.ini: read at startup (vdp_pal is what the running game uses) */
+int crt_apply(const unsigned int *src, int stride, int w, int h, unsigned int *dst, int dw, int dh, int strength);
+#define CRT_DEFAULT 50
+static int g_crt_str = CRT_DEFAULT;   /* scanline strength 0..100 */
 
 static void ini_path(void) {
     char p[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, p, MAX_PATH);
@@ -101,11 +107,19 @@ static void ini_load(void) {
     GetPrivateProfileStringA("Display", "Aspect", "16:9", v, sizeof v, g_ini);
     vdp_wide_enable = (strcmp(v, "4:3") != 0);
     g_intscale = GetPrivateProfileIntA("Display", "IntegerScale", 1, g_ini) != 0;
+    g_crt = GetPrivateProfileIntA("Display", "CRT", 0, g_ini) != 0;
+    g_crt_str = GetPrivateProfileIntA("Display", "CRTStrength", CRT_DEFAULT, g_ini);
+    if (g_crt_str < 0) g_crt_str = 0; if (g_crt_str > 100) g_crt_str = 100;
+    g_pal_pref = GetPrivateProfileIntA("Display", "PAL50Hz", 0, g_ini) != 0;
+    vdp_pal = g_pal_pref;
     set_volume(GetPrivateProfileIntA("Audio", "Volume", 100, g_ini));
 }
 static void ini_save(void) {
     WritePrivateProfileStringA("Display", "Aspect", vdp_wide_enable ? "16:9" : "4:3", g_ini);
     WritePrivateProfileStringA("Display", "IntegerScale", g_intscale ? "1" : "0", g_ini);
+    WritePrivateProfileStringA("Display", "CRT", g_crt ? "1" : "0", g_ini);
+    { char v[16]; snprintf(v, sizeof v, "%d", g_crt_str); WritePrivateProfileStringA("Display", "CRTStrength", v, g_ini); }
+    WritePrivateProfileStringA("Display", "PAL50Hz", g_pal_pref ? "1" : "0", g_ini);
     { char v[16]; snprintf(v, sizeof v, "%d", g_vol); WritePrivateProfileStringA("Audio", "Volume", v, g_ini); }
 }
 static void menu_sync(void) { opt_sync(); }
@@ -144,6 +158,22 @@ static void present(HDC dc) {
     /* The DIB height must equal the source height: with a taller buffer GDI measures the source rectangle from the
      * bottom of the bitmap, which cut the top 16 lines off in 224-line mode. The stride stays 320 pixels. */
     g_bmi.bmiHeader.biWidth = 448; g_bmi.bmiHeader.biHeight = -h;
+    if (g_crt) {
+        /* CRT look: crt.c does the scaling into a buffer of the final size, which is then drawn 1:1.  Falls back to the plain
+         * picture if the window is smaller than the game picture or memory runs out. */
+        static unsigned int *cb; static size_t cbn;
+        size_t need = (size_t)dw * dh;
+        if (dw >= w && dh >= h && need <= 8192u * 4608u) {
+            if (need > cbn) { free(cb); cb = (unsigned int *)malloc(need * 4); cbn = cb ? need : 0; }
+            if (cb && crt_apply((const unsigned int *)fb, 448, w, h, cb, dw, dh, g_crt_str)) {
+                g_bmi.bmiHeader.biWidth = dw; g_bmi.bmiHeader.biHeight = -dh;
+                StretchDIBits(dc, x, y, dw, dh, 0, 0, dw, dh, cb, &g_bmi, DIB_RGB_COLORS, SRCCOPY);
+                g_bmi.bmiHeader.biWidth = 448;
+                return;
+            }
+        }
+        g_bmi.bmiHeader.biHeight = -h;
+    }
     StretchDIBits(dc, x, y, dw, dh, 0, 0, w, h, fb, &g_bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
@@ -247,11 +277,14 @@ static int pad_mask_now(void) {
 #define IDC_R169    1111
 #define IDC_INT     1112
 #define IDC_FS      1113
+#define IDC_CRT     1114
+#define IDC_PAL     1115
+#define IDC_CRTSTR  1116
 #define IDC_VOL     1120
 #define IDC_TAB     1130
 enum { PG_DISPLAY, PG_CONTROLS, PG_AUDIO, NPG };
 #define MAXPG 64
-static HWND g_cw, g_tab, g_slot[NACT][3], g_pg[NPG][MAXPG], g_r43, g_r169, g_chk_int, g_vol_tb, g_vol_txt;
+static HWND g_cw, g_tab, g_slot[NACT][3], g_pg[NPG][MAXPG], g_r43, g_r169, g_chk_int, g_chk_crt, g_crt_tb, g_crt_txt, g_chk_pal, g_vol_tb, g_vol_txt;
 static int g_pgn[NPG];
 static int g_page = PG_DISPLAY;  /* tab that was last shown */
 static int g_cap = -1;           /* slot being captured: action*3 + column */
@@ -267,11 +300,22 @@ static void cw_refresh(void) {
         SetWindowTextA(g_slot[a][c], t);
     }
 }
+static void crt_ctl_sync(void) {            /* the strength bar is only there while the CRT filter is on */
+    if (!g_cw) return;
+    SendMessage(g_crt_tb, TBM_SETPOS, TRUE, g_crt_str);
+    char t[48]; snprintf(t, sizeof t, g_crt_str == CRT_DEFAULT ? "Scanlines %d%%  (default)" : "Scanlines %d%%", g_crt_str);
+    SetWindowTextA(g_crt_txt, t);
+    int v = g_crt && g_page == PG_DISPLAY;
+    ShowWindow(g_crt_tb, v ? SW_SHOW : SW_HIDE); ShowWindow(g_crt_txt, v ? SW_SHOW : SW_HIDE);
+}
 static void opt_sync(void) {               /* bring the Options window's controls in line with the settings */
     if (!g_cw) return;
     SendMessage(g_r43, BM_SETCHECK, vdp_wide_enable ? BST_UNCHECKED : BST_CHECKED, 0);
     SendMessage(g_r169, BM_SETCHECK, vdp_wide_enable ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_chk_int, BM_SETCHECK, g_intscale ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_chk_crt, BM_SETCHECK, g_crt ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_chk_pal, BM_SETCHECK, g_pal_pref ? BST_CHECKED : BST_UNCHECKED, 0);
+    crt_ctl_sync();
     SendMessage(g_vol_tb, TBM_SETPOS, TRUE, g_vol);
     char t[32]; snprintf(t, sizeof t, g_vol ? "%d%%" : "%d%%  (silent)", g_vol);
     SetWindowTextA(g_vol_txt, t);
@@ -292,6 +336,7 @@ static void cw_assign_pad(int m) {
 static void show_page(int pg) {
     g_page = pg;
     for (int p = 0; p < NPG; p++) for (int i = 0; i < g_pgn[p]; i++) ShowWindow(g_pg[p][i], p == pg ? SW_SHOW : SW_HIDE);
+    crt_ctl_sync();
     g_cap = -1; cw_refresh();
 }
 static LRESULT CALLBACK cw_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -311,6 +356,13 @@ static LRESULT CALLBACK cw_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (nh->hwndFrom == g_tab && nh->code == TCN_SELCHANGE) show_page(TabCtrl_GetCurSel(g_tab));
         return 0; }
     case WM_HSCROLL:
+        if ((HWND)l == g_crt_tb) {
+            int v = (int)SendMessage(g_crt_tb, TBM_GETPOS, 0, 0);
+            if (v != CRT_DEFAULT && v >= CRT_DEFAULT - 4 && v <= CRT_DEFAULT + 4) v = CRT_DEFAULT;     /* snaps to the default as it passes */
+            g_crt_str = v; crt_ctl_sync(); InvalidateRect(g_hwnd, NULL, FALSE);
+            if (LOWORD(w) == TB_ENDTRACK) ini_save();
+            return 0;
+        }
         if ((HWND)l == g_vol_tb) { set_volume((int)SendMessage(g_vol_tb, TBM_GETPOS, 0, 0)); opt_sync(); if (LOWORD(w) == TB_ENDTRACK) ini_save(); }   /* heard live, saved when the slider is let go */
         return 0;
     case WM_COMMAND: {
@@ -325,6 +377,8 @@ static LRESULT CALLBACK cw_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case IDC_R43: set_aspect(0); return 0;
         case IDC_R169: set_aspect(1); return 0;
         case IDC_INT: g_intscale = SendMessage(g_chk_int, BM_GETCHECK, 0, 0) == BST_CHECKED; ini_save(); InvalidateRect(g_hwnd, NULL, FALSE); return 0;
+        case IDC_CRT: g_crt = SendMessage(g_chk_crt, BM_GETCHECK, 0, 0) == BST_CHECKED; crt_ctl_sync(); ini_save(); InvalidateRect(g_hwnd, NULL, FALSE); return 0;
+        case IDC_PAL: g_pal_pref = SendMessage(g_chk_pal, BM_GETCHECK, 0, 0) == BST_CHECKED; ini_save(); return 0;
         case IDC_FS: g_do_fs = 1; DestroyWindow(h); return 0;       /* the Options window closes first, then full screen is toggled */
         case IDC_CLOSE: case IDCANCEL: DestroyWindow(h); return 0;
         }
@@ -413,7 +467,18 @@ static void options_window(int page) {
     MK(t, PG_DISPLAY, "STATIC", "The change is applied when the next stage starts.", 0, ox + 12, 148, 560, 22, 0);
     MK(t, PG_DISPLAY, "STATIC", "Window", 0, ox, 196, 300, 22, 0);
     MK(g_chk_int, PG_DISPLAY, "BUTTON", "Whole-number scaling", BS_AUTOCHECKBOX | WS_TABSTOP, ox + 12, 224, 360, 26, IDC_INT);
-    MK(t, PG_DISPLAY, "BUTTON", "Full screen   (F11)", BS_PUSHBUTTON | WS_TABSTOP, ox + 12, 262, 200, 32, IDC_FS);
+    MK(g_chk_crt, PG_DISPLAY, "BUTTON", "CRT filter", BS_AUTOCHECKBOX | WS_TABSTOP, ox + 12, 254, 130, 26, IDC_CRT);
+    g_crt_tb = CreateWindowA("msctls_trackbar32", "", WS_CHILD | TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, ox + 150, 250, 250, 34, g_cw, (HMENU)(UINT_PTR)IDC_CRTSTR, hi, NULL);
+    g_pg[PG_DISPLAY][g_pgn[PG_DISPLAY]++] = g_crt_tb;
+    SendMessage(g_crt_tb, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
+    SendMessage(g_crt_tb, TBM_SETTICFREQ, 10, 0);
+    SendMessage(g_crt_tb, TBM_SETPAGESIZE, 0, 10);
+    SendMessage(g_crt_tb, TBM_SETLINESIZE, 0, 1);
+    MK(g_crt_txt, PG_DISPLAY, "STATIC", "", 0, ox + 410, 258, 220, 22, 0);
+    MK(t, PG_DISPLAY, "BUTTON", "Full screen   (F11)", BS_PUSHBUTTON | WS_TABSTOP, ox + 12, 292, 200, 32, IDC_FS);
+    MK(t, PG_DISPLAY, "STATIC", "Timing", 0, ox, 350, 300, 22, 0);
+    MK(g_chk_pal, PG_DISPLAY, "BUTTON", "50 Hz  (PAL speed)", BS_AUTOCHECKBOX | WS_TABSTOP, ox + 12, 378, 360, 26, IDC_PAL);
+    MK(t, PG_DISPLAY, "STATIC", "Applies after the game is restarted.", 0, ox + 12, 408, 560, 22, 0);
     /* --- Controls */
     MK(t, PG_CONTROLS, "STATIC", "Click a box, then press the key (or pad button) you want.  Backspace / Delete clears a key.", 0, ox, 50, 610, 22, 0);
     MK(t, PG_CONTROLS, "STATIC", "Action", 0, ox, 78, 150, 22, 0);
@@ -752,6 +817,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
 
     WNDCLASSA wc; memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wndproc; wc.hInstance = hi; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hIcon = LoadIcon(hi, MAKEINTRESOURCE(1));          /* the project icon (s3d.rc); NULL = default if it is not compiled in */
     wc.lpszClassName = "S3DNative"; wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassA(&wc);
     g_menu = CreateMenu();
