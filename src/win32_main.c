@@ -90,7 +90,7 @@ static int g_gain = 4096;         /* g_vol as a 12-bit gain (squared curve) */
 static int g_do_fs;               /* full screen requested from the Options window: done once it has closed */
 static void set_volume(int v) { if (v < 0) v = 0; if (v > 100) v = 100; g_vol = v; g_gain = v * v * 4096 / 10000; }
 static int g_intscale = 1;        /* prefer whole-number scaling when it fills most of the window */
-static int g_crt;                 /* software CRT look (crt.c); costs CPU only while on */
+static int g_crt;                 /* software CRT look (crt.c); costs CPU while on (software render) */
 static int g_pal_pref;            /* 50 Hz option from s3d.ini: read at startup (vdp_pal is what the running game uses) */
 int crt_apply(const unsigned int *src, int stride, int w, int h, unsigned int *dst, int dw, int dh, int strength);
 #define CRT_DEFAULT 50
