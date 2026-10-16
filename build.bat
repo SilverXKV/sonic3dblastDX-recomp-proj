@@ -12,11 +12,7 @@ if not exist generated\dispatch.c (
 rem Uses MinGW-w64 gcc if it is on PATH, otherwise finds Visual Studio (2017+) automatically.
 
 where gcc >nul 2>nul
-if %errorlevel%==0 (
-  echo Building with gcc ...
-  gcc -std=gnu11 -O2 -w -Isrc -Igenerated -o "Sonic 3D Blast - Directors Cut Recompiled.exe" src\cpu.c src\hw.c src\render.c src\widescreen.c src\z80.c src\audio.c src\win32_main.c generated\*.c -lgdi32 -lwinmm -lcomdlg32 -luser32 -mwindows
-  goto done
-)
+if %errorlevel%==0 goto gcc
 
 where cl >nul 2>nul
 if %errorlevel%==0 goto msvc
@@ -29,10 +25,22 @@ if "%VSPATH%"=="" goto nocompiler
 if not exist "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" goto nocompiler
 echo Found Visual Studio at %VSPATH%
 call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul
+goto msvc
+
+:gcc
+echo Building with gcc ...
+rem the icon is compiled in when windres is available (the exe still builds without it)
+set "RES="
+where windres >nul 2>nul && windres s3d.rc -O coff -o s3d_res.o && set "RES=s3d_res.o"
+gcc -std=gnu11 -O2 -w -Isrc -Igenerated -o "Sonic 3D Blast - Directors Cut Recompiled.exe" src\cpu.c src\hw.c src\render.c src\widescreen.c src\crt.c src\z80.c src\audio.c src\win32_main.c generated\*.c %RES% -lgdi32 -lwinmm -lcomdlg32 -luser32 -mwindows
+goto done
 
 :msvc
 echo Building with MSVC ...
-cl /nologo /O2 /std:c11 /w /Isrc /Igenerated "/Fe:Sonic 3D Blast - Directors Cut Recompiled.exe" src\cpu.c src\hw.c src\render.c src\widescreen.c src\z80.c src\audio.c src\win32_main.c generated\*.c /link user32.lib gdi32.lib winmm.lib comdlg32.lib /SUBSYSTEM:WINDOWS
+rem the icon is compiled in when rc.exe is available (the exe still builds without it)
+set "RES="
+where rc >nul 2>nul && rc /nologo /fo s3d.res s3d.rc >nul && set "RES=s3d.res"
+cl /nologo /O2 /std:c11 /w /Isrc /Igenerated "/Fe:Sonic 3D Blast - Directors Cut Recompiled.exe" src\cpu.c src\hw.c src\render.c src\widescreen.c src\crt.c src\z80.c src\audio.c src\win32_main.c generated\*.c %RES% /link user32.lib gdi32.lib winmm.lib comdlg32.lib /SUBSYSTEM:WINDOWS
 goto done
 
 :nocompiler
